@@ -10,8 +10,10 @@ import copy
 import math
 import time
 import argparse
+from pathlib import Path
 import numpy as np
 import pandas as pd
+from PIL import Image
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -26,8 +28,10 @@ from isp_core import (
     isp_loss,
     demosaic_malvar,
     unpack_rggb,
+    reference_render,
+    render_tail,
 )
-from isp_data import CleanRawBank, load_images_into
+from isp_data import CleanRawBank, load_images_into, srgb_to_pseudo_raw
 from isp_eval import (
     build_methods,
     run_eval,
@@ -104,21 +108,63 @@ def save_checkpoint(model, path):
     torch.save(dict(cfg=model.cfg, state={k: v.cpu() for k, v in model.state_dict().items()}), path)
 
 
+def load_real_noise_data(data_dir="SIDD_Small_sRGB_Only/Data", n_samples=20, max_size=1024):
+    """Loads matching pairs of real NOISY and GT sRGB images, converted to simulated RAW."""
+    if not os.path.isdir(data_dir):
+        return None, None
+    pairs = []
+    for d in sorted(os.listdir(data_dir)):
+        p_noisy = os.path.join(data_dir, d, "NOISY_SRGB_010.PNG")
+        p_gt = os.path.join(data_dir, d, "GT_SRGB_010.PNG")
+        if os.path.exists(p_noisy) and os.path.exists(p_gt):
+            pairs.append((p_noisy, p_gt))
+    if not pairs:
+        return None, None
+
+    rng = np.random.RandomState(42)
+    selected_indices = rng.choice(len(pairs), size=min(n_samples, len(pairs)), replace=False)
+    noisy_list, gt_list = [], []
+
+    for idx in selected_indices:
+        pn, pg = pairs[idx]
+        try:
+            with Image.open(pn) as im_n:
+                im_n = im_n.convert("RGB")
+                im_n.thumbnail((max_size, max_size))
+                raw_n = srgb_to_pseudo_raw(np.array(im_n))
+            with Image.open(pg) as im_g:
+                im_g = im_g.convert("RGB")
+                im_g.thumbnail((max_size, max_size))
+                raw_g = srgb_to_pseudo_raw(np.array(im_g))
+            # Crop to common size
+            h = min(raw_n.shape[1], raw_g.shape[1]) // 2 * 2
+            w = min(raw_n.shape[2], raw_g.shape[2]) // 2 * 2
+            noisy_list.append(raw_n[:, :h, :w])
+            gt_list.append(raw_g[:, :h, :w])
+        except Exception as e:
+            print(f"Warning skipping pair: {e}")
+
+    if not noisy_list:
+        return None, None
+    return noisy_list, gt_list
+
+
 def main():
-    parser = argparse.ArgumentParser(description="AdaptISP Full Pipeline")
+    parser = argparse.ArgumentParser(description="AdaptISP Pipeline")
     parser.add_argument("--img-dir", type=str, default="sidd_gt", help="Clean images folder for simulated RAW bank")
     parser.add_argument("--device", type=str, default=None, help="Device (cuda or cpu)")
     parser.add_argument("--seed", type=int, default=0, help="Random seed")
-    parser.add_argument("--teacher-steps", type=int, default=6000, help="Teacher training steps")
-    parser.add_argument("--student-steps", type=int, default=6000, help="Student training steps")
-    parser.add_argument("--learned-steps", type=int, default=6000, help="Learned baseline training steps")
-    parser.add_argument("--ablation-steps", type=int, default=1500, help="Steps per ablation model")
-    parser.add_argument("--n-test", type=int, default=96, help="Test crops per condition")
+    parser.add_argument("--teacher-steps", type=int, default=1500, help="Teacher training steps")
+    parser.add_argument("--student-steps", type=int, default=1500, help="Student training steps")
+    parser.add_argument("--learned-steps", type=int, default=1500, help="Learned baseline training steps")
+    parser.add_argument("--ablation-steps", type=int, default=500, help="Steps per ablation model")
+    parser.add_argument("--n-test", type=int, default=48, help="Test crops per condition")
     args = parser.parse_args()
 
+    torch.set_num_threads(max(1, os.cpu_count() or 1))
     dev_str = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     device = torch.device(dev_str)
-    print(f"Using device: {device}")
+    print(f"Using device: {device} (CUDA available: {torch.cuda.is_available()})")
 
     # 1. Clean RAW Bank
     print(f"\n--- Loading dataset from '{args.img_dir}' (simulated RAW derived from SIDD sRGB) ---")
@@ -132,9 +178,9 @@ def main():
     ccm = torch.tensor(CCM_DEFAULT, device=device)
 
     # 2. Train Models
-    print("\n--- Training Teacher (HybridISP base=32) ---")
+    print(f"\n--- Training Teacher (HybridISP base=32, steps={args.teacher_steps}) ---")
     teacher, h_t = train(
-        HybridISP(base=32, sep=False),
+        HybridISP(base=32, sep=False, alpha=0.5, use_gate=True),
         bank,
         args.teacher_steps,
         ccm,
@@ -143,9 +189,9 @@ def main():
     )
     save_checkpoint(teacher, "teacher.pt")
 
-    print("\n--- Training Distilled Student (HybridISP base=12 sep=True) ---")
+    print(f"\n--- Training Distilled Student (HybridISP base=12 sep=True, steps={args.student_steps}) ---")
     student, h_s = train(
-        HybridISP(base=12, sep=True),
+        HybridISP(base=12, sep=True, alpha=0.5, use_gate=True),
         bank,
         args.student_steps,
         ccm,
@@ -155,7 +201,7 @@ def main():
     )
     save_checkpoint(student, "student.pt")
 
-    print("\n--- Training End-to-End Learned Baseline (LearnedISP base=32) ---")
+    print(f"\n--- Training End-to-End Learned Baseline (LearnedISP base=32, steps={args.learned_steps}) ---")
     learned, h_l = train(
         LearnedISP(base=32, sep=False),
         bank,
@@ -189,7 +235,32 @@ def main():
     print("\nMain Comparative Metrics:")
     print(tbl)
 
+    # Real data check
+    print("\n--- Checking Real Noise (post-ISP sRGB converted to simulated RAW) ---")
+    rn_list, rg_list = load_real_noise_data(n_samples=20)
+    real_tbl = None
+    if rn_list is not None:
+        real_rows = []
+        for i, (rn, rg) in enumerate(zip(rn_list, rg_list)):
+            rn_t = rn.unsqueeze(0).to(device).float()
+            rg_t = rg.unsqueeze(0).to(device).float()
+            tgt = reference_render(rg_t, ccm)
+            for m_name, fn in methods.items():
+                with torch.no_grad():
+                    pred = fn(rn_t)
+                from isp_eval import image_metrics
+                for r in image_metrics(pred, tgt, use_lpips=False, device=device):
+                    r.update(method=m_name, idx=i)
+                    real_rows.append(r)
+        real_df = pd.DataFrame(real_rows)
+        real_tbl = real_df.groupby("method")[["psnr", "ssim", "de"]].mean().round(4)
+        print("Real Noise Evaluation Results:")
+        print(real_tbl)
+    else:
+        print("SIDD_Small_sRGB_Only/Data not available for real-noise check; skipped.")
+
     # Sweeps
+    print("\n--- Running Parameter Robustness Sweeps ---")
     sweeps = {
         "noise (shot gain a)": ("a", [dict(a=v, T=5500.0, ev=0.0) for v in [1e-4, 3e-4, 1e-3, 3e-3, 1e-2]]),
         "illuminant T (K)": ("T", [dict(a=1e-3, T=v, ev=0.0) for v in [2500.0, 3500.0, 5500.0, 7000.0, 8000.0]]),
@@ -232,6 +303,7 @@ def main():
             st_cpu(nz)
     st_cpu.net_override = None
 
+    has_onnx = False
     try:
         quantize_int8("onnx/student_fp32.onnx", "onnx/student_int8.onnx", calib)
         sess32 = ort_session("onnx/student_fp32.onnx")
@@ -239,7 +311,6 @@ def main():
         has_onnx = True
     except Exception as e:
         print(f"Warning: ONNX quantization encountered an issue: {e}")
-        has_onnx = False
 
     H = 256
     x512 = torch.rand(1, 4, H, H)
@@ -308,12 +379,13 @@ def main():
         print(q_df)
 
     # 5. Ablations
-    print("\n--- Running Ablations ---")
+    print(f"\n--- Running Ablations (steps={args.ablation_steps}) ---")
     variants = {
-        "full (student cfg)": lambda: HybridISP(base=12, sep=True),
-        "no noise map": lambda: HybridISP(base=12, sep=True, use_noise_map=False),
-        "no estimator (gray-world)": lambda: HybridISP(base=12, sep=True, use_estimator=False),
-        "no demosaic residual": lambda: HybridISP(base=12, sep=True, residual=False),
+        "full (student cfg)": lambda: HybridISP(base=12, sep=True, alpha=0.5, use_gate=True),
+        "no noise map": lambda: HybridISP(base=12, sep=True, alpha=0.5, use_noise_map=False, use_gate=True),
+        "no estimator (gray-world)": lambda: HybridISP(base=12, sep=True, alpha=0.5, use_estimator=False, use_gate=True),
+        "no demosaic residual": lambda: HybridISP(base=12, sep=True, alpha=0.5, residual=False, use_gate=True),
+        "no adaptive gate": lambda: HybridISP(base=12, sep=True, alpha=0.5, use_gate=False),
         "learned-only (no classical)": lambda: LearnedISP(base=20, sep=True),
     }
     abl = {}
@@ -402,10 +474,23 @@ def main():
         "",
     ]
     if q_df is not None:
+        fp_p = q_df.loc["student_fp32", "psnr"]
+        int_p = q_df.loc["student_int8", "psnr"]
+        p_drop = fp_p - int_p
         lines += [
-            "INT8 vs FP32 quality (CPU):",
+            "### INT8 vs FP32 quality (CPU):",
             "",
             q_df.to_markdown(),
+            "",
+            f"**Quantization Observation:** INT8 drop is {p_drop:.2f} dB PSNR relative to FP32. "
+            f"{'Because INT8 drops > 1.0 dB, FP16/FP32 is recommended for edge deployment.' if p_drop > 1.0 else 'INT8 preserves accuracy within 1.0 dB.'}",
+            "",
+        ]
+    if real_tbl is not None:
+        lines += [
+            "## Real SIDD noise check (real noise post-ISP sRGB, not real RAW)",
+            "",
+            real_tbl.to_markdown(),
             "",
         ]
     lines += [

@@ -132,8 +132,16 @@ def load_sidd_gt_into(bank, root, max_scenes=80, crop=1536):
 def load_images_into(bank, folder, max_size=1024):
     """Load images from a flat folder or directory tree, converting sRGB to simulated RAW.
     Groups images by scene instance (e.g. 001_0001.png -> scene '001') so that splits do not leak scenes.
-    Skips unreadable files with a warning.
+    Uses disk cache if present for instant loading.
     """
+    cache_path = os.path.join(folder, "sidd_bank.pt") if os.path.isdir(folder) else "sidd_bank.pt"
+    if not os.path.exists(cache_path) and os.path.exists("sidd_bank.pt"):
+        cache_path = "sidd_bank.pt"
+    if os.path.exists(cache_path):
+        items = torch.load(cache_path, map_location="cpu", weights_only=False)
+        bank.items.extend(items)
+        return len(items)
+
     from PIL import Image
     n = 0
     for dp, _, fs in sorted(os.walk(folder)):

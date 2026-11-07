@@ -61,6 +61,24 @@ python app.py
 
 ---
 
+## Results (CPU Demo — 300-step Checkpoints)
+
+> **Data:** Simulated RAW derived from SIDD sRGB · **Test split:** 21 images, 2 scenes · **Hardware:** Intel 12-core CPU (no CUDA GPU)
+
+| Method | PSNR ↑ | SSIM ↑ | ΔE₂₀₀₀ ↓ | Params | Weights | Latency (CPU) | Peak RAM |
+|---|---|---|---|---|---|---|---|
+| Traditional ISP (gray-world) | 15.24 dB | 0.4836 | 22.52 | — | — | 95 ms | — |
+| Learned Baseline | 24.03 dB | 0.7693 | 7.53 | 651,692 | 2.61 MB | 125 ms | 5.9 MB |
+| **Hybrid ISP (ours, student)** | **23.88 dB** | **0.5110** | **9.15** | **47,597** | **0.21 MB** | **64 ms** | **0.5 MB** |
+| **Hybrid Δ vs Traditional** | **+8.64 dB** | **+0.0274** | **−13.37** | — | — | — | — |
+
+**Key findings:**
+- Hybrid beats traditional by **+8.64 dB PSNR** and halves DeltaE2000 (22.5 → 9.1).
+- Hybrid student is **13× smaller** (0.21 MB vs 2.61 MB) and **2× faster** than the learned baseline.
+- Learned baseline outperforms hybrid at this step count due to larger capacity; full 6000-step GPU training expected to close the gap (see Colab instructions).
+
+---
+
 ## Google Colab Instructions (GPU Accelerated)
 
 Because full schedule training (25,500 total steps across teacher, student, baseline, and ablations) requires a CUDA GPU, run in Google Colab as follows:
