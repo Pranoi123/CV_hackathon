@@ -9,9 +9,15 @@ SIDD_Small_sRGB_Only/
 onnx/
 
 # Results and figures
-results/
+results/*
+!results/ablation*
 *.png
+!results/ablation_plot.png
 !samples/*.png
+
+# App cache
+.gradio/
+full_eval_results.txt
 
 # Python cache and environment
 __pycache__/
