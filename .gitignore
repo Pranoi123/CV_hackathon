@@ -1,0 +1,21 @@
+# Dataset and extracted images
+sidd_gt/
+SIDD_Small_sRGB_Only/
+*.zip
+*.mat
+
+# Model checkpoints and exports
+*.pt
+onnx/
+
+# Results and figures
+results/
+*.png
+!samples/*.png
+
+# Python cache and environment
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.venv/
+env/
